@@ -2,20 +2,24 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """gfx942 a8w4 (MXFP8 A x MXFP4 W) SiTUv2 MoE.
 
-On every gfx942 (MI300X CI runners included) the stage-1 kernel is checked alone against
-torch, in a few seconds. On MI325X, where the path is enabled, it is also run through the
-production fused_moe path:
+On every gfx942 the stage-1 kernel is checked alone against torch, in a few seconds. On
+MI300X and MI325X, where the path is enabled, it is also run through the production
+fused_moe path:
 
 ``AITER_SITUV2_A8W4=1`` makes fused_moe quantise x to MXFP8 (E4M3FNUZ) and dispatch the
 ``_g942`` stage-1 kernels (``moe_2stage_a16wmix/gemm1_a8w4_gfx942.py``) with the a16w4
-stage 2, using the gfx942 rows of ``kimik3_a8w4_tuned_fmoe.csv``. W1 / W1-scale are the
+stage 2 at M <= 512 and the 1-stage asm kernel above, using the gfx942 rows of
+``kimik3_a8w4_tuned_fmoe.csv``. W1 / W1-scale are the
 a16w4 preshuffle relaid by ``shuffle_{weight,scale}_a8w4_gfx942``.
 
-Candidates (both through fused_moe):
+Candidates (all through fused_moe):
   a16w4  bf16 x (the default path)       -> checked against the bf16 torch reference
   a8w4   MXFP8 x (AITER_SITUV2_A8W4=1)   -> checked against the torch reference on x rounded
                                             to MXFP8 (same maths, so near-exact) and, as
                                             ``bf16 err``, against the bf16 reference
+  asm    MXFP8 x (AITER_SITUV2_A8W4=1), the 1-stage asm kernel on the relaid W1,
+         checked like a8w4. Runs instead of a8w4 for the shapes whose a8w4 row picks
+         the asm kernel (M > 512).
 """
 
 import argparse
@@ -29,13 +33,16 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
+    _PADDED_M_TIERS,
     fused_moe,
     fused_topk,
+    get_padded_M,
     moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a8w4_gemm1_gfx942
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.moe_kernels import (
@@ -63,6 +70,27 @@ QI_MAX_TOKEN = (
 CSV = os.path.join(
     os.path.dirname(aiter.__file__), "configs/model_configs/kimik3_a8w4_tuned_fmoe.csv"
 )
+ASM_KERNEL = "pertokenMXfp4Fp8_g1u1_novs_situv2"
+
+
+def asm_tuned(token, model_dim, inter_dim):
+    """The tuned CSV picks the 1-stage asm kernel for this shape (else FlyDSL a8w4)."""
+    df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
+    df = df[
+        (df.gfx == get_gfx())
+        & (df.cu_num == get_cu_num())
+        & (df.model_dim == model_dim)
+        & (df.inter_dim == inter_dim)
+        & (df.expert == EXPERT)
+        & (df.topk == TOPK)
+    ]
+    # the padded M and the tier fallback of get_2stage_cfgs
+    padded = get_padded_M(token)
+    for m in [padded] + [t for t in reversed(_PADDED_M_TIERS) if t < padded]:
+        rows = df[df.token == m]
+        if len(rows):
+            return bool(rows.kernelName1.astype(str).str.contains(ASM_KERNEL).any())
+    return False
 
 
 def mxfp8_quant(x):
@@ -191,7 +219,8 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
 
         return f
 
-    candidates = {"a16w4": (moe(False), ref_bf16), "a8w4": (moe(True), ref_mxfp8)}
+    opt = "asm" if asm_tuned(token, model_dim, inter_dim) else "a8w4"
+    candidates = {"a16w4": (moe(False), ref_bf16), opt: (moe(True), ref_mxfp8)}
 
     flops = (
         2 * token * TOPK * 3 * inter_dim * model_dim
@@ -202,6 +231,9 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
 
     ret = {"gfx": get_gfx()}
     outs = {}
+    # asm requantises the intermediate to fp8 per 128 columns; the torch reference
+    # keeps it in bf16, which puts single elements past atol
+    err_frac = {"asm": 1e-6}
     for name, (fn, ref) in candidates.items():
         out, us = run_perftest(fn)
         outs[name] = out
@@ -216,15 +248,16 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
             atol=2e-2 * ref.abs().max().item(),
             msg=f"{name}: fused_moe vs torch",
         )
-        assert err == 0, (name, err)
+        assert err <= err_frac.get(name, 0), (name, err)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
         ret[f"{name} cos"] = cos_diff(ref, out)
     # Self-check: the tolerance above must catch a localized error. Zero one output
-    # row and confirm err > 0, so a silent wrong-output bug would not pass the loop above.
-    _probe = outs["a8w4"].clone()
+    # row and confirm err > err_frac, so a silent wrong-output bug would not pass the
+    # loop above.
+    _probe = outs[opt].clone()
     _probe[0] = 0
     _probe_err = checkAllclose(
         ref_mxfp8.to(dtypes.fp32),
@@ -233,7 +266,9 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
         atol=2e-2 * ref_mxfp8.abs().max().item(),
         printLog=False,
     )
-    assert _probe_err > 0, "self-check: zeroing one output row was not caught"
+    assert _probe_err > err_frac.get(
+        opt, 0
+    ), "self-check: zeroing one output row was not caught"
     # Pre-quantised x (MXFP8 + a1_scale, as from an MXFP8 dispatch): the moe_sort rows
     # read it as is and must give the a8w4 output of bf16 x (up to the run-to-run
     # order of the stage-2 sums, cos diff ~1e-5); the `_qi` rows (M <= 8) quantise x
@@ -246,10 +281,10 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
             token,
             "pre-quantised x refused above the _qi rows",
         )
-        ret["a8w4 fp8 x"] = "refused"
+        ret[f"{opt} fp8 x"] = "refused"
     else:
-        ret["a8w4 fp8 x"] = cos_diff(outs["a8w4"], out_q)
-        assert ret["a8w4 fp8 x"] < 1e-4, ret
+        ret[f"{opt} fp8 x"] = cos_diff(outs[opt], out_q)
+        assert ret[f"{opt} fp8 x"] < 1e-4, ret
     # W1 in the layout the other path reads (same shape and dtype) must raise, not give
     # wrong output: the a8w4 relayout is told apart only by its a8w4_gfx942_layout tag.
     for a8w4 in (True, False):
@@ -260,16 +295,16 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
         else:
             raise AssertionError(f"a8w4={a8w4} ran on the other W1 layout")
     # the precision cost of the opt-in path: a8w4 vs the bf16-activation reference
-    ret["a8w4 bf16 cos"] = cos_diff(ref_bf16, outs["a8w4"])
-    assert ret["a8w4 bf16 cos"] < 1e-2, ret
+    ret[f"{opt} bf16 cos"] = cos_diff(ref_bf16, outs[opt])
+    assert ret[f"{opt} bf16 cos"] < 1e-2, ret
     return ret
 
 
 def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512, E=8, topk=4):
     """The stage-1 kernel alone against torch on x rounded to MXFP8, on any gfx942.
 
-    The MI325X-only gate is about speed, so the numerics are checked on MI300X too (the
-    CI runners), bypassing it. Kept to a few seconds: few experts, and model_dim 1536
+    The MI300X / MI325X gate is about speed, so the numerics are checked on every gfx942,
+    bypassing it. Kept to a few seconds: few experts, and model_dim 1536
     instead of Kimi-K3's 3584 (the K loop is unrolled, so compile time grows with it);
     like 3584 it leaves k_wave 4 an odd number of K tiles per wave (3 vs 7), so the
     odd-tail path is still covered. With E = topk every expert gets every token, so
@@ -410,9 +445,9 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512, E=8, t
     )
 
 
-def test_gate_off_mi325x():
-    """Off MI325X the a8w4 stage 1 must refuse (it is slower than a16w4 at large M on
-    MI300X) rather than run; checked before any tensor is read."""
+def test_gate_off():
+    """Off MI300X / MI325X the a8w4 stage 1 must refuse rather than run; checked before
+    any tensor is read."""
     from aiter.fused_moe import _flydsl_stage1_wrapper
 
     x = torch.zeros((1, 256), dtype=dtypes.bf16)
@@ -424,7 +459,7 @@ def test_gate_off_mi325x():
             x, w1, None, ids, ids[:2], ids[:1], None, 1, kernelName=name
         )
     except NotImplementedError as e:
-        assert "MI325X only" in str(e), e
+        assert "MI300X and MI325X only" in str(e), e
     else:
         raise AssertionError(f"{name} ran on {torch.cuda.get_device_name()}")
 
@@ -538,10 +573,10 @@ def main():
     test_csv_qi_rows()
     test_relayout_refuses_gugu()
     if not a8w4_gfx942_supported():
-        test_gate_off_mi325x()
+        test_gate_off()
         aiter.logger.warning(
-            "a8w4 gfx942 MoE through fused_moe is enabled on MI325X only (on MI300X "
-            "it is slower than a16w4 at large M); skipping it on %s",
+            "a8w4 gfx942 MoE through fused_moe is enabled on MI300X and MI325X only; "
+            "skipping it on %s",
             torch.cuda.get_device_name(),
         )
         return
@@ -563,7 +598,7 @@ def main():
         "--token",
         type=int,
         nargs="*",
-        # 1024 / 4096 reach the large-M tiles of the tuned CSV
+        # 1024 / 4096 select the 1-stage asm kernel in the tuned CSV
         default=[1, 2, 16, 128, 1024, 4096],
         help="number of tokens",
     )

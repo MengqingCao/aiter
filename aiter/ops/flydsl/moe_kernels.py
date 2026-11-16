@@ -232,7 +232,8 @@ def check_a8w4_gfx942_inputs(
     if not is_g942 and any(relaid):
         raise ValueError(
             "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
-            "(a8w4_gfx942_layout), which only the `_g942` kernels read, but stage 1 "
+            "(a8w4_gfx942_layout), which only the `_g942` kernels and the gfx942 "
+            "1-stage asm kernel read, but stage 1 "
             f"is {kernel_name}; is AITER_SITUV2_A8W4=1 set?"
         )
     if not is_g942:
@@ -683,6 +684,11 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+# MI300X and MI300X VF (SR-IOV guests). They share the MI325X tuned CSV rows (same
+# gfx942 / 304 CU key); at M >= 1024 the rows pick the 1-stage asm kernel.
+_MI300X_CHIP_IDS = {0x74A1, 0x74B5}
+
+
 @functools.cache
 def _a8w4_gfx942_chip_id(device: int) -> int:
     # 0 when the id cannot be read, so the gate fails closed.
@@ -695,12 +701,7 @@ def _a8w4_gfx942_chip_id(device: int) -> int:
 
 
 def a8w4_gfx942_supported(device=None) -> bool:
-    """True on the gfx942 parts the a8w4 stage1 is enabled on (MI325X).
-
-    MI300X (0x74A1) is the same gfx942 / 304 CU part, so it shares the tuned CSV rows,
-    but there a8w4 is slower than a16w4 at large M (latency-bound stage 1; 0.81-0.89x
-    at M >= 1024).
-    """
+    """True on the gfx942 parts the a8w4 stage1 is enabled on (MI300X, MI325X)."""
     if os.getenv("AITER_AOT_REPLAY") == "1":
         # An AOT replay has no device and compiles for the arch GPU_ARCHS names; the
         # device check applies when serving.
@@ -710,7 +711,7 @@ def a8w4_gfx942_supported(device=None) -> bool:
         idx = torch.cuda.current_device()
     from aiter.jit.utils.chip_info import MI325X_CHIP_IDS
 
-    return _a8w4_gfx942_chip_id(int(idx)) in MI325X_CHIP_IDS
+    return _a8w4_gfx942_chip_id(int(idx)) in MI325X_CHIP_IDS | _MI300X_CHIP_IDS
 
 
 def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
@@ -724,7 +725,7 @@ def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
     ``_qi``: the kernel quantises the bf16 x to MXFP8 itself (``x_layout="bf16"``), so
     fused_moe skips the separate quant launch -- a win at small M (the CSV uses it for
     M <= 8).
-    Enabled on MI325X only (see ``a8w4_gfx942_supported``).
+    Enabled on MI300X and MI325X only (see ``a8w4_gfx942_supported``).
     """
     kernels = {}
 
@@ -1965,8 +1966,7 @@ def _flydsl_moe_stage1_impl(
             # Off gfx942, compile_gemm1_a8w4_gfx942 raises for the compile target.
             if not a8w4_gfx942_supported(dev):
                 raise NotImplementedError(
-                    "gfx942 a8w4 stage1 is enabled on MI325X only: on MI300X it is "
-                    "slower than a16w4 at large M (0.81-0.89x at M>=1024); "
+                    "gfx942 a8w4 stage1 is enabled on MI300X and MI325X only; "
                     "use a16w4"
                 )
             if _fuse_any_quant or _is_splitk or gate_up_interleave or bias is not None:
