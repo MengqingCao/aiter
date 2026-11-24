@@ -340,7 +340,9 @@ def sol_jensen_cap(
         from aiter.ops.triton.attention.utils import _sol_attn_pack_k_variance
 
         if mean_k_var_pooled is None:
-            raise ValueError("an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled")
+            raise ValueError(
+                "an hd256 MXFP6 or MXFP8 K's variance needs mean_k_var_pooled"
+            )
         var, var_scale = _sol_attn_pack_k_variance(
             mean_k_var_pooled.float() * gain.unsqueeze(-1),
             "mxfp6" if bits == 6 * d else "mxfp8",
