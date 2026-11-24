@@ -22,6 +22,8 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
         --expect-large-m --compare-main --bs-list 1,64,513,8192 --accuracy-max-bs 8192
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes
+    # MiniMax-M3.1 EP4 with its SwiGLU-OAI activation, staged route:
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --network m31 --bs-list 104,128
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
@@ -107,6 +109,16 @@ NETWORKS = {
         "act": "situv2",
         "situ_beta": 4.0,
         "situ_linear_beta": 25.0,
+    },
+    # MiniMax-M3.1 EP4 layout and activation: SwiGLU-OAI (alpha 1.702, up + 1)
+    # clamped at the checkpoint's swiglu_limit of 7.
+    "m31": {
+        "model_dim": 6144,
+        "inter_dim": 3072,
+        "experts": 128,
+        "topk": 4,
+        "swiglu_limit": 7.0,
+        "act": "swigluoai",
     },
 }
 
@@ -392,6 +404,10 @@ def _reference(
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             hidden = gate * up
+        elif act == "swigluoai":
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+            hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1)
         else:
             # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
             # unconditionally turns up into zeros at the operator's own default of
