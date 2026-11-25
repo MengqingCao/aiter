@@ -169,6 +169,15 @@ def _rel_l2(output, reference):
     return float(torch.sqrt(error_sq / reference_sq))
 
 
+def _mxfp8_round(v):
+    """Round-trip through MXFP8: 1x32 blocks, E8M0 scale rounded up, E4M3 values."""
+    blocks = v.float().reshape(*v.shape[:-1], -1, 32)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).to(torch.float8_e4m3fn).float() * scale
+    return q.reshape(v.shape)
+
+
 def _all_ranks(flag, device):
     """Whether ``flag`` holds on every rank."""
     return bool(_reduce_float(bool(flag), device, dist.ReduceOp.MIN))
@@ -374,7 +383,10 @@ def _reference(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    quantize=False,
 ):
+    """fp32 MoE output; ``quantize`` emulates the a8w4 op's MXFP8 rounding of
+    the input and of the GEMM1 activation output."""
     x_all, token_counts = _all_gather_variable(x)
     weights_all, _ = _all_gather_variable(route_weights, token_counts)
     ids_all, _ = _all_gather_variable(ids, token_counts)
@@ -396,6 +408,8 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
+        if quantize:
+            inp = _mxfp8_round(inp)
         gate = inp @ w1[:inter_dim].T
         up = inp @ w1[inter_dim:].T
         if act == "situv2":
@@ -416,6 +430,8 @@ def _reference(
                 gate = gate.clamp(max=swiglu_limit)
                 up = up.clamp(-swiglu_limit, swiglu_limit)
             hidden = F.silu(gate) * up
+        if quantize:
+            hidden = _mxfp8_round(hidden)
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -424,7 +440,7 @@ def _reference(
     return partial[start : start + x.shape[0]]
 
 
-def _moe_reference(moe, x, route_weights, ids, ref_weights):
+def _moe_reference(moe, x, route_weights, ids, ref_weights, quantize=False):
     """_reference() for the layout and activation of ``moe``."""
     return _reference(
         x,
@@ -440,6 +456,7 @@ def _moe_reference(moe, x, route_weights, ids, ref_weights):
         moe.act,
         moe.situ_beta,
         moe.situ_linear_beta,
+        quantize,
     )
 
 

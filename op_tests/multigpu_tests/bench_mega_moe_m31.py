@@ -9,13 +9,17 @@ The instance is the one ATOM builds: a8w4, --mtpr 512, swiglu_limit 7, staged ro
 unless --routed. Weights are random MXFP4: the op streams them, its time does not
 depend on their values. Per point it reports the graph-replay time of one call
 (median of --trials replays of a --calls-call graph, max over ranks), the relL2
-against the fp32 reference of the op's own activation, and the rows each rank receives.
+against an emulation of the op's own MXFP8 quantization (the error check), the
+relL2 against the fp32 reference of its activation, and the rows each rank receives.
+With --baseline, a point whose emulation error exceeds the baseline run's largest
+one fails the run.
 
 The capture is a directory of part*.pt files, each a list of per-MoE-call records
 {"layer", "rows", "hidden", "topk_ids", "topk_w"}.
 
     torchrun --nproc-per-node 4 bench_mega_moe_m31.py --capture DIR --act silu --out base.json
-    torchrun --nproc-per-node 4 bench_mega_moe_m31.py --capture DIR --act swigluoai --out oai.json
+    torchrun --nproc-per-node 4 bench_mega_moe_m31.py --capture DIR --act swigluoai \
+        --baseline base.json --out oai.json
 """
 
 import argparse
@@ -96,8 +100,15 @@ def main():
     p.add_argument("--trials", type=int, default=15)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True, help="JSON results (rank 0)")
+    p.add_argument(
+        "--baseline", help="JSON of a baseline run: gate relL2_vs_emul on its max"
+    )
     args = p.parse_args()
     points = json.loads(args.points) if args.points else POINTS
+    emul_limit = None
+    if args.baseline:
+        with open(args.baseline) as f:
+            emul_limit = max(r["relL2_vs_emul"] for r in json.load(f)["results"])
 
     rank, world, device = T._setup_dist()
     if world != 4 or any(len(c) != world for c in points.values()):
@@ -130,8 +141,8 @@ def main():
 
             out = fn()[: x.shape[0]].clone()
             T._barrier()
-            ref = T._moe_reference(moe, x, w, ids, ref_w)
-            rel = T._rel_l2(out, ref)
+            rel = T._rel_l2(out, T._moe_reference(moe, x, w, ids, ref_w))
+            emul = T._rel_l2(out, T._moe_reference(moe, x, w, ids, ref_w, True))
             us = T._time_replays(fn, args.calls, args.trials, device)
             recv = torch.bincount((ids.long() // moe.epr).flatten(), minlength=world)
             dist.all_reduce(recv)
@@ -141,6 +152,7 @@ def main():
                 "requests_per_rank": counts,
                 "max_tokens": max_tokens,
                 "us": round(us, 1),
+                "relL2_vs_emul": round(emul, 6),
                 "relL2_vs_fp32": round(rel, 6),
                 "recv_rows_per_rank": recv.tolist(),
             }
@@ -148,7 +160,7 @@ def main():
             if rank == 0:
                 print(
                     f"[M31] act={args.act} layer={layer} {name:<10} "
-                    f"rows={max_tokens:>3} us={us:7.1f} relL2={rel:.4f}",
+                    f"rows={max_tokens:>3} us={us:7.1f} emul={emul:.5f} relL2={rel:.4f}",
                     flush=True,
                 )
     if rank == 0:
@@ -156,6 +168,14 @@ def main():
             json.dump({"args": vars(args), "results": results}, f, indent=1)
     T._barrier()
     T._cleanup()
+    worse = [
+        r for r in results if emul_limit is not None and r["relL2_vs_emul"] > emul_limit
+    ]
+    if worse:
+        raise AssertionError(
+            f"relL2_vs_emul above the baseline's {emul_limit} at "
+            + ", ".join(f"layer {r['layer']} {r['point']}" for r in worse)
+        )
 
 
 if __name__ == "__main__":
