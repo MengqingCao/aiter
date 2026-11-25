@@ -121,10 +121,10 @@ NETWORKS = {
         "topk": 4,
         "swiglu_limit": 7.0,
         "act": "swigluoai",
-        # Its fused routes must send BF16 combine rows, a hot expert's included.
-        "bf16_combine": True,
     },
 }
+# Networks whose fused routes must send BF16 combine rows, a hot expert's included.
+BF16_COMBINE_NETWORKS = {"m31"}
 
 
 def _setup_dist():
@@ -1444,7 +1444,7 @@ def _routes_edges(ctx, args):
             for rt in moe._small_m_runtimes
         )
         fp8_peers = int(_reduce_float(fp8_peers, device, dist.ReduceOp.SUM))
-        if ctx.net.get("bf16_combine"):
+        if args.network in BF16_COMBINE_NETWORKS:
             ok = ok and fp8_peers == 0
         if rank == 0:
             print(
