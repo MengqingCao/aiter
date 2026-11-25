@@ -16,7 +16,8 @@ weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
 rows, CUDA graph replay against eager, and paired timing against the staged route.
 The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
-(--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
+(--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks),
+or MiniMax-M3.1 (--network m31) on 4 ranks, which has no large-input route.
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -27,6 +28,7 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network m31 --mtpr 1024 --check-time-acc
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -1289,7 +1291,8 @@ def _routes_instance(args, rank, world, device):
     if moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
-            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
+            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks, "
+            "MiniMax-M3.1 on 4 ranks) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(
@@ -1488,6 +1491,44 @@ def _routes_alternation(ctx, args, outputs):
     return keys
 
 
+def _routes_above_small_m(ctx, args):
+    """A call one row above the small-input capacity takes the staged route on every
+    rank (or the large-input one where the layout builds it) and matches the reference.
+    """
+    moe, rank, device = ctx.moe, ctx.rank, ctx.device
+    n = moe.small_m_mtpr + 1
+    if n > moe.mtpr:
+        return
+    tx, tw, ti = _make_inputs(
+        n,
+        ctx.net["model_dim"],
+        ctx.net["experts"],
+        ctx.net["topk"],
+        rank,
+        args.seed + 300,
+        device,
+        force_fanout_boundary=False,
+        inject_invalid_route=False,
+        force_padding_boundary=False,
+    )
+    ctx.bind(0, 0)
+    expect = ROUTE_LARGE_M if ctx.large_m else ROUTE_STAGED
+    # Ranks with fewer rows still see the EP-wide max_tokens, so they take the same route.
+    k = n if rank == 0 else n // 2
+    out = _routed(moe, tx[:k], tw[:k], ti[:k], n, expect)
+    _barrier()
+    rel_ref = _rel_l2(out, _moe_reference(moe, tx[:k], tw[:k], ti[:k], ctx.refw[0]))
+    ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+    if rank == 0:
+        print(
+            f"[ABOVE] max_tokens={n} route={expect} relL2_vs_ref={rel_ref:.6f} "
+            f"{'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("above small-input capacity")
+
+
 def _routes_graph(ctx, args):
     """A CUDA graph of --graph-layers small-input calls over alternating layers, replayed
     on new inputs, against the same calls run eagerly."""
@@ -1659,6 +1700,7 @@ def _run_routes(args, rank, world, device):
             )
         if wrap_mism:
             ctx.failures.append("epoch wrap")
+        _routes_above_small_m(ctx, args)
         _routes_graph(ctx, args)
     _routes_timing(ctx, args)
     _barrier()
@@ -1891,9 +1933,9 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+        if args.network not in ("v4_pro", "v41_flash", "m31") or args.quant != "a8w4":
             raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+                "--suite routes needs --network v4_pro, v41_flash or m31 and --quant a8w4"
             )
         args.seed = 7 if args.seed is None else args.seed
         args.rtol = 0.08 if args.rtol is None else args.rtol
