@@ -121,6 +121,8 @@ NETWORKS = {
         "topk": 4,
         "swiglu_limit": 7.0,
         "act": "swigluoai",
+        # Its fused routes must send BF16 combine rows, a hot expert's included.
+        "bf16_combine": True,
     },
 }
 
@@ -1436,9 +1438,18 @@ def _routes_edges(ctx, args):
         _barrier()
         rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
         ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+        # Each peer publishes its flag here as (flag << 1 | sent FP8 rows).
+        fp8_peers = sum(
+            int((rt.comb_op.shmem_xdev_bar_mem[:world] & 1).sum())
+            for rt in moe._small_m_runtimes
+        )
+        fp8_peers = int(_reduce_float(fp8_peers, device, dist.ReduceOp.SUM))
+        if ctx.net.get("bf16_combine"):
+            ok = ok and fp8_peers == 0
         if rank == 0:
             print(
-                f"[EDGE] {name} tpr={n} relL2_vs_ref={rel_ref:.6f} {'PASS' if ok else 'FAIL'}",
+                f"[EDGE] {name} tpr={n} relL2_vs_ref={rel_ref:.6f} fp8_peers={fp8_peers} "
+                f"{'PASS' if ok else 'FAIL'}",
                 flush=True,
             )
         if not ok:
