@@ -1263,7 +1263,7 @@ class SiluQuantEpilogue:
                     words.append(fx.Int32(rocdl.cvt_pk_fp8_f32(
                         T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
             valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
-            out_byte = valid.select(row * fx.Int32(row_bytes) + gcol // fx.Int32(2 if self._is_fp4 else 1),
+            out_byte = valid.select(row * fx.Int32(row_bytes) + ((gcol >> fx.Int32(1)) if self._is_fp4 else gcol),
                 fx.Int32(0x40000000))
             buf_copy_store(out_vec, out_byte // fx.Int32(4 * out_unit),
                 words[0] if self._is_fp4 else Vec.from_elements(words, fx.Int32), fx.Int32, unit_elems=out_unit,
