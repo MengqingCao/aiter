@@ -1725,7 +1725,8 @@ class SmallMRuntime:
         ):
             raise ValueError("SmallMRuntime supports the fused layouts (fused_layout_supported) on 8-XCD gfx950 only")
         # The activation format of the payload rows and of the GEMM1 output. The payload storage stays sized for
-        # MXFP8 rows (payload_capacity, comb_cfg): an MXFP4 row uses the first half of its MXFP8 row's bytes.
+        # MXFP8 rows (payload_capacity, comb_cfg): MXFP4 rows are packed at half the stride, so they fill the first
+        # half of each region (fixed slots, token rows) and leave the rest unused.
         self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
         # The config of every token bucket. The ranks of a launch may pick different buckets, so the knobs that
         # change what ranks or launches exchange are the same for every bucket (one protocol per runtime).

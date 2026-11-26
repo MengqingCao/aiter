@@ -125,6 +125,9 @@ NETWORKS = {
 }
 # Networks whose fused routes must send BF16 combine rows, a hot expert's included.
 BF16_COMBINE_NETWORKS = {"m31"}
+# Routes suite, a4w4: relL2 bound of the fused route against the staged route (measured 0.027 at --mtpr 1024,
+# where the staged route sends FP8 combine rows).
+A4W4_STAGED_RTOL = 0.05
 
 
 def _setup_dist():
@@ -1409,7 +1412,10 @@ def _routes_accuracy(ctx, args):
             pad_ok = _all_ranks(torch.isfinite(out_g).all(), device)
             pad_zero = _all_ranks((out_g[real:] == 0).all(), device) if pad else True
             outputs[(name, which)] = (xi, wi, ii, out_g, real, max_tokens)
-            ok = rel_ref < args.rtol and rel_staged < args.rtol and pad_ok
+            # a4w4: the fp32 bound is loose for MXFP4, so a tighter one against the staged route catches
+            # fused-only error.
+            staged_rtol = A4W4_STAGED_RTOL if args.quant == "a4w4" else args.rtol
+            ok = rel_ref < args.rtol and rel_staged < staged_rtol and pad_ok
             if rank == 0:
                 print(
                     f"[ACC] {name:10s} w{which} tpr={tpr} pad={pad} relL2_vs_ref={rel_ref:.6f} "
