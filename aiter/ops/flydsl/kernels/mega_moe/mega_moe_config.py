@@ -59,21 +59,24 @@ V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
 # EP8 DeepSeek-V4-Pro, the default fused layout.
 V4_PRO_EP8_LAYOUT = (8, REFERENCE_EXPERTS_PER_RANK, V4_MODEL_DIM, V4_INTER_DIM)
+# EP4 MiniMax-M3.1: (world_size, experts_per_rank, model_dim, inter_dim), top-4, SwiGLU-OAI clamped at 7.
+M31_EP4_LAYOUT = (4, 32, 6144, 3072)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
-FUSED_LAYOUTS = frozenset(
-    {
-        (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
-        *(
-            (world, model_dim, inter_dim, world * epr, 6)
-            for world, epr, model_dim, inter_dim in (
-                V41_FLASH_EP4_LAYOUT,
-                V41_FLASH_EP2_LAYOUT,
-                V41_FLASH_EP8_LAYOUT,
-            )
-        ),
-    }
-)
+# serve, each with the one (act, swiglu_limit) it is built for: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8
+# DeepSeek-V4.1-Flash (clamped SiLU at 10), EP4 MiniMax-M3.1 (SMALL_M_ONLY_LAYOUTS).
+FUSED_LAYOUTS = {
+    (world, model_dim, inter_dim, world * epr, topk): act
+    for (world, epr, model_dim, inter_dim), topk, act in (
+        (V4_PRO_EP8_LAYOUT, 6, ("silu", 10.0)),
+        (V41_FLASH_EP4_LAYOUT, 6, ("silu", 10.0)),
+        (V41_FLASH_EP2_LAYOUT, 6, ("silu", 10.0)),
+        (V41_FLASH_EP8_LAYOUT, 6, ("silu", 10.0)),
+        (M31_EP4_LAYOUT, 4, ("swigluoai", 7.0)),
+    )
+}
+# FUSED_LAYOUTS keys without a large-input route (its epilogue is SiLU only, its combine wire FP8 only): a call
+# the small-input route cannot take goes staged.
+SMALL_M_ONLY_LAYOUTS = frozenset({(4, 6144, 3072, 128, 4)})
 # Quant modes of the fused routes (small- and large-input kernels alike). A4W4 starts from a layout's A8W4 tune and
 # takes its own changes on top (_tune_a4w4_small / _tune_a4w4_large).
 FUSED_QUANTS = ("a8w4", "a4w4")
@@ -294,6 +297,9 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input fused kernel: the GEMM2 rows are BF16 at any routed-row count and under a hot expert (False: a
+    # rank past _FP8_ROWS_MIN_ROWS routed rows or with a hot expert sends FP8 rows).
+    bf16_wire: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,17 +456,18 @@ def fused_layout_supported(
     act: str = "silu",
     fanout_masks: tuple[int, ...] = (),
 ) -> bool:
-    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a FUSED_QUANTS quant on gfx950.
+    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS with its act and swiglu_limit, a
+    FUSED_QUANTS quant on gfx950.
 
     The small-input kernel serves every such layout up to SMALL_M_MAX_MTPR rows a
-    rank on 256-CU parts, the large-input kernel the capacities in LARGE_M_MTPRS.
+    rank on 256-CU parts, the large-input kernel the capacities in LARGE_M_MTPRS
+    of the layouts outside SMALL_M_ONLY_LAYOUTS.
     """
     return (
         arch.split(":", 1)[0] == "gfx950"
-        and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
+        and FUSED_LAYOUTS.get((world_size, model_dim, inter_dim, experts, topk))
+        == (act, swiglu_limit)
         and quant in FUSED_QUANTS
-        and swiglu_limit == 10.0
-        and act == "silu"
         and not fanout_masks
     )
 
@@ -1340,10 +1347,11 @@ def select_mega_moe_config(
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
-        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
-        # reject the combination here instead of at launch.
-        raise ValueError(
-            f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
+        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout: a
+        # BF16 wire takes the plain Stage2.
+        config = _replace_config(
+            config,
+            stage2={"aligned_pair": False, "pair_cu": 0},
         )
     return config
 
@@ -1816,6 +1824,24 @@ def _tune_a4w4_v4_pro_large(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig
     return config
 
 
+def _tune_m31_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP4 MiniMax-M3.1 small-input kernel (32 experts per rank, top-4), measured on gfx950 with captured routing:
+    the EP4 DeepSeek-V4.1-Flash tune (_tune_v41_flash_ep4_small), both quants, with a BF16 combine wire at any
+    row count (the M3.1 numerics). Other buckets than 128 keep that tune unmeasured on M3.1.
+    """
+    config = _tune_v41_flash_ep4_small(config, bucket)
+    config = replace(config, fused_stage1=replace(config.fused_stage1, bf16_wire=True))
+    if bucket == 128:
+        # The decode points (96-152 rows a rank): cached W1, and GEMM2 CTAs leaving GEMM1 after 2/16 of its work
+        # so the GEMM2 scatter overlaps it: 1-8% at the c140 / c150 points.
+        config = replace(
+            config,
+            stage1=replace(config.stage1, b_nt=0),
+            fused_stage2=replace(config.fused_stage2, early_k=2, early_p=2),
+        )
+    return config
+
+
 @cache
 def _fused_config(
     bucket: int,
@@ -1849,6 +1875,8 @@ def _fused_config(
         config = _tune_v41_flash_ep2_small(config, bucket)
     elif layout == V41_FLASH_EP8_LAYOUT:
         config = _tune_v41_flash_ep8_small(config, bucket)
+    elif layout == M31_EP4_LAYOUT:
+        config = _tune_m31_ep4_small(config, bucket)
     if quant == "a4w4":
         config = _tune_a4w4_small(config, layout, bucket)
     return config

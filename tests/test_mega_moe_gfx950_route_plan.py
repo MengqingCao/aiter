@@ -26,6 +26,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
+    SMALL_M_ONLY_LAYOUTS,
     TOKEN_BUCKETS,
     FusedStage1Knobs,
     FusedStage2Knobs,
@@ -81,6 +82,33 @@ def _plan(mtpr, *, small=DEFAULT_SMALL_M_MTPRS, large=None):
         small_m_mtprs=small,
         large_m=mtpr in LARGE_M_MTPRS if large is None else large,
     )
+
+
+def test_m31_fused_layout():
+    """EP4 MiniMax-M3.1: fused with its SwiGLU-OAI at 7 only, both quants, no large-input route, BF16 wire."""
+    m31 = dict(
+        V4_PRO, world_size=4, model_dim=6144, inter_dim=3072, experts=128, topk=4
+    )
+    m31.update(act="swigluoai", swiglu_limit=7.0)
+    for quant in ("a8w4", "a4w4"):
+        assert fused_layout_supported(**{**m31, "quant": quant})
+    assert not fused_layout_supported(**{**m31, "act": "silu"})
+    assert not fused_layout_supported(**{**m31, "swiglu_limit": 10.0})
+    assert not fused_layout_supported(**{**V41_FLASH_EP4, "act": "swigluoai"})
+    key = (4, 6144, 3072, 128, 4)
+    assert key in SMALL_M_ONLY_LAYOUTS
+    assert not SMALL_M_ONLY_LAYOUTS & {(4, 5120, 2304, 384, 6), (8, 7168, 3072, 384, 6)}
+    shape = {
+        "world_size": 4,
+        "experts_per_rank": 32,
+        "model_dim": 6144,
+        "inter_dim": 3072,
+    }
+    for quant in ("a8w4", "a4w4"):
+        for mtpr in (256, 512):
+            for tokens in (1, 104, mtpr):
+                config = select_fused_config(tokens, mtpr, **shape, quant=quant)
+                assert config.fused_stage1.bf16_wire
 
 
 def test_fused_layout_gate():
@@ -427,7 +455,7 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
 
 # Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune): they enter the
 # table only when set, so a pinned digest changes only where a config sets one.
-_LATE_KNOBS = ("stream_w",)
+_LATE_KNOBS = ("stream_w", "bf16_wire")
 
 
 def _knob_table(config):

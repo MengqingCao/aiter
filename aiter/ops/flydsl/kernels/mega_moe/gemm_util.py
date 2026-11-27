@@ -8,7 +8,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
+from ..act import sigmoid_f32, situ_mul, swiglu_mul_batch, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
 from ..kernels_common import LOG2E
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
@@ -836,6 +836,15 @@ def silu_mul_f32(g, u, swiglu_limit=0.0, fast=False):
     return _silu_f32(-(-g).maximumf(-limit), fast) * fx.clampf(u, -limit, limit)
 
 
+def gated_act_f32(g, u, act, swiglu_limit=0.0, fast=False):
+    """``act`` of gate g and up u: silu_mul_f32, or SwiGLU-OAI ("swigluoai": g clamped above and u to
+    +-swiglu_limit, then g * sigmoid(1.702 * g) * (u + 1))."""
+    if act == "swigluoai":
+        return swiglu_mul_batch([g], [u], fx.Float32(-swiglu_limit))[0]
+    assert act == "silu", f"unsupported gated act {act!r}"
+    return silu_mul_f32(g, u, swiglu_limit, fast)
+
+
 class SiluQuantEpilogue:
     """silu(gate)*up -> fp8/fp4 + per-32 E8M0 out-scale."""
 
@@ -862,7 +871,8 @@ class SiluQuantEpilogue:
         self._act = act
         self._situ_beta = float(situ_beta)
         self._situ_linear_beta = float(situ_linear_beta)
-        assert act in ("silu", "situv2"), f"unsupported mega_moe act {act!r}"
+        assert act in ("silu", "situv2", "swigluoai"), f"unsupported mega_moe act {act!r}"
+        assert act != "swigluoai" or self._swiglu_limit > 0, "swigluoai requires a positive swiglu_limit"
         if act == "situv2":
             assert self._situ_beta > 0.0 and self._situ_linear_beta > 0.0, \
                 "situv2 requires positive beta / linear_beta"
@@ -922,7 +932,10 @@ class SiluQuantEpilogue:
                 for i in range_constexpr(4)
             ]
             return Vec.from_elements(elems, fx.Float32)
-        elems = [silu_mul_f32(gv[i], uv[i], self._swiglu_limit, self._fast_silu) for i in range_constexpr(4)]
+        elems = [
+            gated_act_f32(gv[i], uv[i], self._act, self._swiglu_limit, self._fast_silu)
+            for i in range_constexpr(4)
+        ]
         return Vec.from_elements(elems, fx.Float32)
 
     def _tile_out(self, tile_i32, elem, unit_elems=1):
