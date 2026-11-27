@@ -258,7 +258,7 @@ class MegaMoEV2:
                 ", large-input route" if plan.large_m else "",
             )
             if self.large_m_dropped:
-                logger.info("MegaMoEV2 combine_wire='bf16': large-input route not built (FP8 combine only)")
+                logger.warning("MegaMoEV2 combine_wire='bf16': large-input route not built (FP8 combine only)")
 
     @property
     def small_m_mtpr(self) -> int:
