@@ -10,6 +10,7 @@ GEMM1-output and combine-input storage are views of the instance's shared arenas
 """
 
 import functools
+from dataclasses import replace
 from enum import IntEnum
 
 import flydsl.compiler as flyc
@@ -745,7 +746,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192)) and cap == required_cap
+    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192), (4, 32)) and cap == required_cap
 
 
 # fmt: off
@@ -758,7 +759,7 @@ def compile_mega_moe_stage1(
     num_dispatch_cu: int = 32, b_nt: int = 3, swiglu_limit: float = 0.0,
     g2_early: tuple = (0, 0), head_uniform: bool = False, g2_epi_lean: int = 0, direct_done: int = 0,
     tok_done: bool = False, tok_counters: bool = False, bf16_head_tokens: int = 0, stream_w: bool = False,
-    a_dtype: str = "fp8",
+    a_dtype: str = "fp8", act: str = "silu", bf16_wire: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -797,7 +798,7 @@ def compile_mega_moe_stage1(
     fz_tile_m = int(sort_block_m)
     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
-        raise ValueError("small-input stage1 needs the EP8/48-, EP4/96- or EP2/192-expert fixed-slot layout")
+        raise ValueError("small-input stage1 needs the EP8/48-, EP4/96-, EP2/192- or EP4/32-expert fixed-slot layout")
     fz_total_experts = fz_npes * fz_epr
     # Producers load their token (experts, remote pointers, row, scales, weights) ahead of the payload loop and
     # quantize the bf16 input row to MXFP8 (MXFP4 for a_dtype fp4) once; a producer wave sends pre_rounds tokens
@@ -896,14 +897,14 @@ def compile_mega_moe_stage1(
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
         f"megamoe_small_stage1_w{NUM_WAVES}_gm{grid_mult}_dcu{dispatch_blocks}_wpe{waves_per_eu_hint}"
-        f"_bnt{b_cache_modifier}{swiglu_suffix}"
+        f"_bnt{b_cache_modifier}{swiglu_suffix}{'' if act == 'silu' else '_' + act}"
         f"_fused{'_'.join(str(v) for v in fused)}"
         f"{f'_g2l{g2_epi_lean}' if g2_epi_lean else ''}"
         f"{'_hu' if head_uniform else ''}{f'_dn{direct_done}' if direct_done else ''}"
         f"{'_td' if tok_done else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
-        f"{'_afp4' if a_fp4 else ''}"
+        f"{'_afp4' if a_fp4 else ''}{'_bw' if bf16_wire else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1037,12 +1038,13 @@ def compile_mega_moe_stage1(
             return expert, expert * fx.Int32(fz_cap) + tile, rows, tiles_e
 
         ring_g1 = {cm: make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
-            nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, swiglu_limit=swiglu_limit)
+            nw=NUM_WAVES, bm=sort_block_m, pf=ring_pf1, nbuf=ring_nb1, w_cm=cm, swiglu_limit=swiglu_limit,
+            act=act)
             for cm in {b_cache_modifier, 0}}
         # An m-tile of at most half the rows is its expert's only one: its half-height bodies stream the weights.
         ring_g1_half = make_ring_gemm1(a_fp4=a_fp4, model_dim=model_dim, inter_dim=inter_dim, tile_n=tile_n,
             nw=NUM_WAVES, bm=half_rows, pf=ring_pf1, nbuf=ring_nb1, w_cm=b_cache_modifier,
-            swiglu_limit=swiglu_limit, tile_rows=sort_block_m) if half_rows else None
+            swiglu_limit=swiglu_limit, act=act, tile_rows=sort_block_m) if half_rows else None
         ring_g2_start, ring_g2_run = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=sort_block_m,
             bn=g2_bn, nw=NUM_WAVES, pf=ring_pf2, nbuf=ring_nb2)
         ring_g2_run_half = make_ring_gemm2(model_dim=model_dim, inter_dim=inter_dim, bm=half_rows, bn=g2_bn,
@@ -1253,7 +1255,7 @@ def compile_mega_moe_stage1(
         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
-        if const_expr(tok_done):
+        if const_expr(tok_done or bf16_wire):
             fp8_rows = fx.Int32(0)
         tok_off = tok_reset = fx.Int64(0)
         if const_expr(tok_counters):
@@ -1412,7 +1414,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     return dict(  # noqa: C408
         g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), head_uniform=k1.head_uniform,
         g2_epi_lean=k1.g2_epi_lean, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
-        bf16_head_tokens=k1.bf16_head_tokens, stream_w=k1.stream_w,
+        bf16_head_tokens=k1.bf16_head_tokens, stream_w=k1.stream_w, bf16_wire=k1.bf16_wire,
     )
     # fmt: on
 
@@ -1494,10 +1496,12 @@ class SmallMRuntime:
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, swiglu_limit: float = 0.0, payload_arena=None, s1_output_arena=None,
-        combine_input=None):
+        max_tok_per_rank: int, swiglu_limit: float = 0.0, act: str = "silu", payload_arena=None,
+        s1_output_arena=None, combine_input=None, bf16_wire: bool = False):
     # fmt: on
-        """``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
+        """``bf16_wire``: every token bucket sends BF16 combine rows, whatever its tuned config says.
+
+        ``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
         the routes of one MegaMoEV2 (see GroupMajorPayloadArena, stage1_output_buffers and
         FlyDSLDispatchCombineIntraNodeOp); None allocates."""
         if quant not in FUSED_QUANTS:
@@ -1519,6 +1523,7 @@ class SmallMRuntime:
         self.swiglu_limit = float(swiglu_limit)
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
+        self.act = act
         self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
         self.dev = torch.device("cuda", rank)
         # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
@@ -1527,7 +1532,7 @@ class SmallMRuntime:
             fused_layout_supported(
                 arch=get_gfx_runtime(), world_size=self.world_size, model_dim=self.model_dim,
                 inter_dim=self.inter_dim, experts=self.experts, topk=self.topk, quant=quant,
-                swiglu_limit=self.swiglu_limit,
+                swiglu_limit=self.swiglu_limit, act=self.act,
             )
             and small_m_cu_supported(torch.cuda.get_device_properties(self.dev).multi_processor_count)
         ):
@@ -1542,6 +1547,11 @@ class SmallMRuntime:
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= self.mtpr
         }
+        if bf16_wire:
+            self._configs = {
+                bucket: replace(config, fused_stage1=replace(config.fused_stage1, bf16_wire=True))
+                for bucket, config in self._configs.items()
+            }
         protocols = {
             (bool(k.direct_done), k.tok_counters, k.bf16_head_tokens)
             for k in (config.fused_stage1 for config in self._configs.values())
@@ -1777,7 +1787,7 @@ class SmallMRuntime:
             fused=fused, num_cu=self._s1_num_cu, sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n,
             num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 2), num_dispatch_cu=stage1.num_dispatch_cu,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
-            a_dtype=self._a_dtype, **_kernel_knobs(config))
+            a_dtype=self._a_dtype, act=self.act, **_kernel_knobs(config))
         # fmt: on
         self._launchers[config] = launch
         return launch

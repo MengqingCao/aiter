@@ -25,7 +25,7 @@ from flydsl.expr.typing import Vector as Vec
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import lds_vec_load
 from ..tensor_shim import buf_base_i64, buf_copy_atom, buf_copy_store, ptr_buf_tensor
-from .gemm_util import _e8m0_scale, _group_absmax, silu_mul_f32
+from .gemm_util import _e8m0_scale, _group_absmax, gated_act_f32
 
 _STEP_K = 128
 _SLOT = 1024
@@ -201,9 +201,10 @@ def make_ring_gemm1(
     nbuf,
     w_cm,
     swiglu_limit,
+    act="silu",
     tile_rows=None
 ):
-    """GEMM1 + SwiGLU + MXFP8 quant of one unit (``bm`` rows x ``tile_n // 2``
+    """GEMM1 + ``act`` (gated_act_f32) + MXFP8 quant of one unit (``bm`` rows x ``tile_n // 2``
     intermediate columns), traced in the kernel by the returned ``tile``; its output
     m-tiles are ``tile_rows`` (default ``bm``) rows apart."""
     tile_rows = tile_rows or bm
@@ -225,11 +226,11 @@ def make_ring_gemm1(
     sc_rounds = _rounds(bm * sc_row, nw)
     sc_base = nbuf * ring.pitch
     kt2 = inter_dim // _STEP_K
-    act = fx.Float4E2M1FN if a_fp4 else fx.Float8E4M3FN
+    a_type = fx.Float4E2M1FN if a_fp4 else fx.Float8E4M3FN
     atoms = [
         fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(
-                16, 16, 128, fx.Float4E2M1FN, act, opsel_a=o, opsel_b=0
+                16, 16, 128, fx.Float4E2M1FN, a_type, opsel_a=o, opsel_b=0
             )
         )
         for o in range(4)
@@ -430,9 +431,10 @@ def make_ring_gemm1(
             for g in range(ni // 2):
                 y = [
                     [
-                        silu_mul_f32(
+                        gated_act_f32(
                             Vec(acc[mi][(2 * g + t) * 2])[v],
                             Vec(acc[mi][(2 * g + t) * 2 + 1])[v],
+                            act,
                             swiglu_limit,
                         )
                         for v in range(4)
